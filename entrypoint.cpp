@@ -1,7 +1,7 @@
 /*
 #==========================================================================================
 # + + +   This Software is released under the "Simplified BSD License"  + + +
-# Copyright 2014 F4GKR Sylvain AZARIAN . All rights reserved.
+# Copyright 2016 SDR Technologies SAS and F4GKR Sylvain AZARIAN . All rights reserved.
 #
 #Redistribution and use in source and binary forms, with or without modification, are
 #permitted provided that the following conditions are met:
@@ -34,51 +34,97 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <pthread.h>
-#include <semaphore.h>
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <QString>
+#include <QSettings>
+#include <QLibrary>
+#include <QDebug>
 
-#include "sdrplay_stub.h"
 #include "entrypoint.h"
+#include "mir_sdr.h"
+
 #define DEBUG_DRIVER (0)
+#define MAX_RSP_BOARDS (8)
+#define SDRPLAY_AM_MIN     150e3
+#define SDRPLAY_AM_MAX      30e6
+#define SDRPLAY_FM_MIN      64e6
+#define SDRPLAY_FM_MAX     108e6
+#define SDRPLAY_B3_MIN     162e6
+#define SDRPLAY_B3_MAX     240e6
+#define SDRPLAY_B45_MIN    470e6
+#define SDRPLAY_B45_MAX    960e6
+#define SDRPLAY_L_MIN     1450e6
+#define SDRPLAY_L_MAX     1675e6
 
 char *driver_name ;
-void* acquisition_thread( void *params ) ;
-SDRPlayStub *stub ;
+
+struct RSP_Params {
+    mir_sdr_Bw_MHzT bwType;
+    int sampling_rate ;
+    int decim_factor ;
+    int queue_size ;
+};
 
 struct t_sample_rates {
     unsigned int *sample_rates ;
+    struct RSP_Params *rsp_params ;
+
     int enum_length ;
     int preffered_sr_index ;
+
 };
+
+
+typedef struct __attribute__ ((__packed__)) _sCplx
+{
+    float re;
+    float im;
+} TYPECPX;
+
+#define QUEUE_SIZE (65536*4)
 
 // this structure stores the device state
 struct t_rx_device {
 
     char *device_name ;
+    unsigned int idx ;
     char *device_serial_number ;
 
     struct t_sample_rates* rates;
-    int current_sample_rate ;
-
-    int64_t min_frq_hz ; // minimal frequency for this device
-    int64_t max_frq_hz ; // maximal frequency for this device
-    int64_t center_frq_hz ; // currently set frequency
 
 
-    float gain ;
-    float gain_min ;
-    float gain_max ;
+    qint64 hw_frequency ;
+    int gRdB;
+    double gain_dB;
+    double fsHz;
+    double rfHz;
+    int decimation ;
+    mir_sdr_Bw_MHzT bwType;
+    mir_sdr_If_kHzT ifType;
+    mir_sdr_AgcControlT agcControl;
+    mir_sdr_ReasonForReinitT reinitReson;
+
+    int maxGain;
+    int samplesPerPacket;
+    int minGain;
+    int dcMode;
+    int agcSetPoint;
+    int gRdBsystem;
+    int lnaEnable;
+    qint64 min_frq_hz ;
+    qint64 max_frq_hz ;
 
     char *uuid ;
     bool running ;
-    bool acq_stop ;
-    sem_t mutex;
 
-    pthread_t receive_thread ;
+    //
+    TYPECPX *samples_block ;
+    unsigned int wr_pos ;
+    int queue_size  ;
+
     // for DC removal
     TYPECPX xn_1 ;
     TYPECPX yn_1 ;
@@ -86,11 +132,32 @@ struct t_rx_device {
     struct ext_Context context ;
 };
 
-int device_count ;
+unsigned int device_count ;
 char *stage_name ;
 char *stage_unit ;
-
+mir_sdr_DeviceT devices[MAX_RSP_BOARDS] ;
 struct t_rx_device *rx;
+
+
+mir_sdr_ApiVersion_t call_mir_sdr_ApiVersion ;
+mir_sdr_DebugEnable_t call_mir_sdr_DebugEnable ;
+mir_sdr_GetDevices_t call_mir_sdr_GetDevices ;
+mir_sdr_DCoffsetIQimbalanceControl_t call_mir_sdr_DCoffsetIQimbalanceControl;
+mir_sdr_DecimateControl_t call_mir_sdr_DecimateControl ;
+mir_sdr_AgcControl_t call_mir_sdr_AgcControl ;
+mir_sdr_StreamInit_t call_mir_sdr_StreamInit ;
+
+mir_sdr_Reinit_t call_mir_sdr_Reinit ;
+
+mir_sdr_SetDcMode_t call_mir_sdr_SetDcMode ;
+mir_sdr_SetDcTrackTime_t call_mir_sdr_SetDcTrackTime ;
+mir_sdr_SetSyncUpdatePeriod_t call_mir_sdr_SetSyncUpdatePeriod ;
+mir_sdr_SetSyncUpdateSampleNum_t call_mir_sdr_SetSyncUpdateSampleNum ;
+mir_sdr_StreamUninit_t call_mir_sdr_StreamUninit ;
+
+mir_sdr_SetDeviceIdx_t call_mir_sdr_SetDeviceIdx ;
+mir_sdr_ReleaseDeviceIdx_t call_mir_sdr_ReleaseDeviceIdx ;
+mir_sdr_GetHwVersion_t call_mir_sdr_GetHwVersion ;
 
 _tlogFun* sdrNode_LogFunction ;
 _pushSamplesFun *acqCbFunction ;
@@ -99,9 +166,16 @@ _pushSamplesFun *acqCbFunction ;
 #include <windows.h>
 // Win  DLL Main entry
 BOOL WINAPI DllMain( HINSTANCE hInstance, DWORD dwReason, LPVOID *lpvReserved ) {
+    Q_UNUSED(hInstance);
+    Q_UNUSED(dwReason);
+    Q_UNUSED(lpvReserved);
     return( TRUE ) ;
 }
+
 #endif
+
+void reinit_device(struct t_rx_device* dev) ;
+void set_gain_limits( struct t_rx_device* dev, double freq );
 
 void log( int device_id, int level, char *msg ) {
     if( sdrNode_LogFunction != NULL ) {
@@ -110,6 +184,8 @@ void log( int device_id, int level, char *msg ) {
     }
     printf("Trace:%s\n", msg );
 }
+
+
 
 
 
@@ -128,75 +204,177 @@ LIBRARY_API int initLibrary(char *json_init_params,
                             _tlogFun* ptr,
                             _pushSamplesFun *acqCb ) {
 
+
     struct t_rx_device *tmp ;
-
-#ifdef _WIN64
-    const size_t WCHARBUF = 100;
-    const char dllname[] = "./mir_sdr_api.dll" ;
-    wchar_t  wszDest[WCHARBUF];
-    MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, dllname, -1, wszDest, WCHARBUF);
-#endif
-
     sdrNode_LogFunction = ptr ;
     acqCbFunction = acqCb ;
-    stub = new SDRPlayStub();
+    QString fileName ;
+    mir_sdr_ErrT err;
+    float ver;
 
+    Q_UNUSED(json_init_params);
+
+#ifdef _WIN64
+    QSettings m("HKEY_LOCAL_MACHINE\\SOFTWARE\\SDRplay",
+                QSettings::NativeFormat);
+    m.beginGroup("API");
+    fileName = m.value("Install_Dir").toString() + "\\x64\\mir_sdr_api.dll";
+    m.endGroup();
+#else
+    fileName = "./mir_sdr_api.dll" ;
+#endif
+
+    QLibrary *extDLL = new QLibrary( fileName );
+    if( extDLL == NULL ) {
+        return(-1);
+    }
+    call_mir_sdr_ApiVersion = (mir_sdr_ApiVersion_t)extDLL->resolve("mir_sdr_ApiVersion");
+    call_mir_sdr_DebugEnable = (mir_sdr_DebugEnable_t)extDLL->resolve("mir_sdr_DebugEnable");
+    call_mir_sdr_GetDevices = (mir_sdr_GetDevices_t)extDLL->resolve("mir_sdr_GetDevices");
+    call_mir_sdr_DCoffsetIQimbalanceControl = (mir_sdr_DCoffsetIQimbalanceControl_t)extDLL->resolve("mir_sdr_DCoffsetIQimbalanceControl");
+    call_mir_sdr_DecimateControl = (mir_sdr_DecimateControl_t)extDLL->resolve("mir_sdr_DecimateControl");
+    call_mir_sdr_AgcControl = (mir_sdr_AgcControl_t)extDLL->resolve("mir_sdr_AgcControl");
+    call_mir_sdr_StreamInit = (mir_sdr_StreamInit_t)extDLL->resolve("mir_sdr_StreamInit");
+
+    call_mir_sdr_Reinit = (mir_sdr_Reinit_t)extDLL->resolve("mir_sdr_Reinit");
+
+    call_mir_sdr_SetDcMode = (mir_sdr_SetDcMode_t)extDLL->resolve("mir_sdr_SetDcMode");
+    call_mir_sdr_SetDcTrackTime = (mir_sdr_SetDcTrackTime_t)extDLL->resolve("mir_sdr_SetDcTrackTime");
+    call_mir_sdr_SetSyncUpdatePeriod = (mir_sdr_SetSyncUpdatePeriod_t)extDLL->resolve("mir_sdr_SetSyncUpdatePeriod");
+    call_mir_sdr_SetSyncUpdateSampleNum = (mir_sdr_SetSyncUpdateSampleNum_t)extDLL->resolve("mir_sdr_SetSyncUpdateSampleNum");
+    call_mir_sdr_StreamUninit = (mir_sdr_StreamUninit_t)extDLL->resolve("mir_sdr_StreamUninit");
+
+
+    call_mir_sdr_SetDeviceIdx = (mir_sdr_SetDeviceIdx_t)extDLL->resolve("mir_sdr_SetDeviceIdx");
+    call_mir_sdr_ReleaseDeviceIdx = (mir_sdr_ReleaseDeviceIdx_t)extDLL->resolve("mir_sdr_ReleaseDeviceIdx");
+    call_mir_sdr_GetHwVersion = (mir_sdr_GetHwVersion_t)extDLL->resolve("mir_sdr_GetHwVersion");
+
+    if( call_mir_sdr_ApiVersion == NULL ) {
+        if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "resolve 'sdr_ApiVersion' fails" ;
+        return(-1);
+    }
+
+    err = (*call_mir_sdr_ApiVersion)(&ver);
+    if( DEBUG_DRIVER ) qDebug() << "sdr_ApiVersion() -->" << (ver) ;
+    if (ver != MIR_SDR_API_VERSION) {
+        if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "sdr_ApiVersion() not valid " ;
+        return(-1);
+    }
+
+
+    if( call_mir_sdr_DebugEnable == NULL ) {
+        if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "resolve 'mir_sdr_DebugEnable' fails" ;
+        return(-1);
+    }
+    if( DEBUG_DRIVER ) {
+        (*call_mir_sdr_DebugEnable)(1);
+    } else {
+        (*call_mir_sdr_DebugEnable)(0);
+    }
+
+    err = (*call_mir_sdr_GetDevices)((mir_sdr_DeviceT*)&devices,
+                                     &device_count, MAX_RSP_BOARDS);
+    if( err != mir_sdr_Success) {
+        device_count = 0 ;
+        if( DEBUG_DRIVER ) qDebug() << "call_mir_sdr_GetDevices -->" << err ;
+        return(-1);
+    }
+
+
+   if( DEBUG_DRIVER ) qDebug() << "PlayTools::PlayTools() ok with board_count=" << device_count ;
 
     driver_name = (char *)malloc( 100*sizeof(char));
     snprintf(driver_name,100,"SDRPlay");
-    if( stub->loadDLL( wszDest ) == false ) {
-        return(0);
-    }
 
-    // only one RSP managed...
-    device_count = 1 ;
     rx = (struct t_rx_device *)malloc( device_count * sizeof(struct t_rx_device));
     if( rx == NULL ) {
         return(0);
     }
+
     tmp = rx ;
     // iterate through devices to populate structure
-    for( int d=0 ; d < device_count ; d++ , tmp++ ) {
+    // TO DO : test device availabilty !
+    for( unsigned int d=0 ; d < device_count ; d++ , tmp++ ) {
+
+        tmp->idx = d ;
         tmp->uuid = NULL ;
         tmp->running = false ;
-        tmp->acq_stop = false ;
-        sem_init(&tmp->mutex, 0, 0);
-
         tmp->device_name = (char *)malloc( 64 *sizeof(char));
-        tmp->device_serial_number = (char *)malloc( 16 *sizeof(char));
+        tmp->device_serial_number = (char *)malloc( 256 *sizeof(char));
         sprintf( tmp->device_name, "SDRPlay");
-        sprintf( tmp->device_serial_number, "0001");
+        sprintf( tmp->device_serial_number, "%s", devices[d].SerNo );
 
-        tmp->min_frq_hz =  100e3 ;
+        tmp->min_frq_hz = 150e3 ;
         tmp->max_frq_hz = 2000e6 ;
 
-
-        tmp->center_frq_hz = tmp->min_frq_hz + 1e6 ; // arbitrary startup freq
+        tmp->wr_pos = 0 ;
+        tmp->samples_block = NULL ;
+        tmp->queue_size = QUEUE_SIZE ;
 
         // allocate rates
         tmp->rates = (struct t_sample_rates*)malloc( sizeof(struct t_sample_rates));
-        tmp->rates->enum_length = 6 ; // we manage 5 different sampling rates
+        tmp->rates->enum_length = 6 ;
+
         tmp->rates->sample_rates = (unsigned int *)malloc( tmp->rates->enum_length * sizeof( unsigned int )) ;
-        tmp->rates->sample_rates[0] =  700*1000 ;
-        tmp->rates->sample_rates[1] = 1536*1000 ;
+        tmp->rates->rsp_params  = ( struct RSP_Params *)malloc( sizeof( struct RSP_Params ) * tmp->rates->enum_length ) ;
+
+        struct RSP_Params *ptr = tmp->rates->rsp_params ;
+
+
+
+        tmp->rates->sample_rates[0] =  600*1000 ;
+        ptr[0].bwType = mir_sdr_BW_0_600 ;
+        ptr[0].sampling_rate = 2400000 ;
+        ptr[0].decim_factor = 4 ;
+        ptr[0].queue_size = 128000 ;
+
+        tmp->rates->sample_rates[1] =  1536*1000 ;
+        ptr[1].bwType = mir_sdr_BW_1_536 ;
+        ptr[1].sampling_rate = 6144000 ;
+        ptr[1].decim_factor = 4 ;
+        ptr[1].queue_size = 256e3 ;
+
         tmp->rates->sample_rates[2] = 5000*1000 ;
+        ptr[2].bwType = mir_sdr_BW_5_000 ;
+        ptr[2].decim_factor = 1 ;
+        ptr[2].sampling_rate = 5000*1000 ;
+        ptr[2].queue_size = 1024e3 ;
+
         tmp->rates->sample_rates[3] = 6000*1000 ;
+        ptr[3].bwType = mir_sdr_BW_6_000 ;
+        ptr[3].decim_factor = 1 ;
+        ptr[3].sampling_rate = 6000*1000 ;
+        ptr[3].queue_size = 1024e3 ;
+
         tmp->rates->sample_rates[4] = 7000*1000 ;
-        tmp->rates->sample_rates[5] = 7000*1000 ;
-        tmp->rates->preffered_sr_index = 1 ; // our default sampling rate will be 1024 KHz
+        ptr[4].bwType = mir_sdr_BW_7_000 ;
+        ptr[4].decim_factor = 1 ;
+        ptr[4].sampling_rate = 7000*1000 ;
+        ptr[4].queue_size = 1024e3 ;
+
+        tmp->rates->sample_rates[5] = 8000*1000 ;
+        ptr[5].bwType = mir_sdr_BW_8_000 ;
+        ptr[5].decim_factor = 1 ;
+        ptr[5].sampling_rate = 8000*1000 ;
+        ptr[5].queue_size = 1024e3 ;
+
+        tmp->rates->preffered_sr_index = 1 ; // our default sampling rate will be 1536 KHz
+        tmp->running = false ;
+        tmp->fsHz = ptr[tmp->rates->preffered_sr_index].sampling_rate ;
+        tmp->decimation = ptr[tmp->rates->preffered_sr_index].decim_factor ;
+        tmp->bwType = ptr[tmp->rates->preffered_sr_index].bwType ;
+        tmp->ifType = mir_sdr_IF_Zero ;
+        tmp->dcMode = 0 ;
+        tmp->gRdB = 50 ;
+        tmp->agcSetPoint = -30 ;
+        tmp->lnaEnable = 0 ;
+        tmp->agcControl = mir_sdr_AGC_100HZ ;
+        tmp->hw_frequency = 96e6 ;
+
+        set_gain_limits( tmp, 96e6 );
 
 
-        // set default SR
-        tmp->current_sample_rate = tmp->rates->sample_rates[tmp->rates->preffered_sr_index] ;
-
-        tmp->gain_min = -100 ;
-        tmp->gain_max = -30 ;
-        tmp->gain = tmp->gain_min + (tmp->gain_max - tmp->gain_min)/2 ;
-        stub->setGainReduction( tmp->gain );
         tmp->context.ctx_version = 0 ;
-
-        // create acquisition threads
-        pthread_create(&tmp->receive_thread, NULL, acquisition_thread, tmp );
     }
 
     // all RTLSDR have one single gain stage
@@ -222,7 +400,7 @@ LIBRARY_API int setBoardUUID( int device_id, char *uuid ) {
     if( uuid == NULL ) {
         return(RC_NOK);
     }
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
 
     len = strlen(uuid);
@@ -241,7 +419,7 @@ LIBRARY_API int setBoardUUID( int device_id, char *uuid ) {
  */
 LIBRARY_API char *getHardwareName(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s\n", __func__);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(NULL);
     struct t_rx_device *dev = &rx[device_id] ;
     return( dev->device_name );
@@ -263,7 +441,7 @@ LIBRARY_API int getBoardCount() {
  */
 LIBRARY_API int getPossibleSampleRateCount(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s\n", __func__);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
     struct t_rx_device *dev = &rx[device_id] ;
     return( dev->rates->enum_length );
@@ -277,7 +455,7 @@ LIBRARY_API int getPossibleSampleRateCount(int device_id) {
  */
 LIBRARY_API unsigned int getPossibleSampleRateValue(int device_id, int index) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, index );
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
     struct t_rx_device *dev = &rx[device_id] ;
 
@@ -290,7 +468,7 @@ LIBRARY_API unsigned int getPossibleSampleRateValue(int device_id, int index) {
 
 LIBRARY_API unsigned int getPrefferedSampleRateValue(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s\n", __func__);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
     struct t_rx_device *dev = &rx[device_id] ;
     struct t_sample_rates* rates = dev->rates ;
@@ -300,7 +478,7 @@ LIBRARY_API unsigned int getPrefferedSampleRateValue(int device_id) {
 //-------------------------------------------------------------------
 LIBRARY_API int64_t getMin_HWRx_CenterFreq(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s\n", __func__);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
     struct t_rx_device *dev = &rx[device_id] ;
     return( dev->min_frq_hz ) ;
@@ -308,7 +486,7 @@ LIBRARY_API int64_t getMin_HWRx_CenterFreq(int device_id) {
 
 LIBRARY_API int64_t getMax_HWRx_CenterFreq(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s\n", __func__);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
     struct t_rx_device *dev = &rx[device_id] ;
     return( dev->max_frq_hz ) ;
@@ -322,13 +500,11 @@ LIBRARY_API int64_t getMax_HWRx_CenterFreq(int device_id) {
 //-------------------------------------------------------------------
 LIBRARY_API int getRxGainStageCount(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    // RTLSDR have only one stage
     return(1);
 }
 
 LIBRARY_API char* getRxGainStageName( int device_id, int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
-    // RTLSDR have only one stage so the name is same for all
     return( stage_name );
 }
 
@@ -346,18 +522,18 @@ LIBRARY_API int getRxGainStageType( int device_id, int stage) {
 
 LIBRARY_API float getMinGainValue(int device_id,int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
-    struct t_rx_device *dev = &rx[device_id] ;
-    return( dev->gain_min ) ;
+
+    return( -90 ) ;
 }
 
 LIBRARY_API float getMaxGainValue(int device_id,int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(0);
-    struct t_rx_device *dev = &rx[device_id] ;
-    return( dev->gain_max ) ;
+
+    return( -30 ) ;
 }
 
 LIBRARY_API int getGainDiscreteValuesCount( int device_id, int stage ) {
@@ -377,7 +553,7 @@ LIBRARY_API float getGainDiscreteValue( int device_id, int stage, int index ) {
  */
 LIBRARY_API char* getSerialNumber( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
     struct t_rx_device *dev = &rx[device_id] ;
     return( dev->device_serial_number );
@@ -396,15 +572,18 @@ LIBRARY_API char* getSerialNumber( int device_id ) {
  */
 LIBRARY_API int prepareRXEngine( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
 
     // here we keep it simple, just fire the relevant mutex
     struct t_rx_device *dev = &rx[device_id] ;
-    dev->acq_stop = false ;
-    sem_post(&dev->mutex);
+    if( dev->running ) {
+        return(RC_OK);
+    }
 
-    return(RC_OK);
+    reinit_device(dev);
+
+    return( (dev->running ? 1:0));
 }
 
 /**
@@ -414,11 +593,14 @@ LIBRARY_API int prepareRXEngine( int device_id ) {
  */
 LIBRARY_API int finalizeRXEngine( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
 
     struct t_rx_device *dev = &rx[device_id] ;
-    dev->acq_stop = true ;
+    if( dev->running ) {
+        (*call_mir_sdr_StreamUninit)() ;
+        dev->running = false ;
+    }
     return(RC_OK);
 }
 
@@ -430,22 +612,34 @@ LIBRARY_API int finalizeRXEngine( int device_id ) {
  */
 LIBRARY_API int setRxSampleRate( int device_id , int sample_rate) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id,sample_rate);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
 
     struct t_rx_device *dev = &rx[device_id] ;
-    if( sample_rate == dev->current_sample_rate ) {
-        return(RC_OK);
+    struct RSP_Params *ptr = (struct RSP_Params*)dev->rates->rsp_params ;
+
+    for(  int i=0 ; i < dev->rates->enum_length ; i++ ) {
+         if( dev->rates->sample_rates[i] == (unsigned int)sample_rate ) {
+             dev->fsHz = (double)ptr[i].sampling_rate ;
+             dev->bwType = ptr[i].bwType ;
+             dev->decimation = ptr[i].decim_factor ;
+             if( !dev->running ) {
+                 dev->queue_size = ptr[i].queue_size ;
+                 if( DEBUG_DRIVER ) qDebug() << "setting queue size to " << dev->queue_size ;
+             }
+
+             if( ptr[i].decim_factor > 1 )  {
+                 (*call_mir_sdr_DecimateControl)(1, dev->decimation, 0);
+             } else {
+                 (*call_mir_sdr_DecimateControl)(0, 2, 0);
+             }
+             dev->reinitReson = (mir_sdr_ReasonForReinitT)(dev->reinitReson | mir_sdr_CHANGE_BW_TYPE);
+             break ;
+         }
     }
 
-    if( stub->isRunning() ) {
-        return(RC_NOK);
-    }
-
-    dev->current_sample_rate = sample_rate ;
-    dev->context.ctx_version++ ;
+    set_gain_limits( dev, dev->rfHz ) ;
     dev->context.sample_rate = sample_rate ;
-
     return(RC_OK);
 }
 
@@ -456,10 +650,10 @@ LIBRARY_API int setRxSampleRate( int device_id , int sample_rate) {
  */
 LIBRARY_API int getActualRxSampleRate( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
     struct t_rx_device *dev = &rx[device_id] ;
-    return(dev->current_sample_rate);
+    return( (int)(dev->fsHz/dev->decimation) );
 }
 
 /**
@@ -471,15 +665,18 @@ LIBRARY_API int getActualRxSampleRate( int device_id ) {
 LIBRARY_API int setRxCenterFreq( int device_id, int64_t frq_hz ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%ld)\n", __func__, device_id, (long)frq_hz);
     if( DEBUG_DRIVER ) fflush(stderr);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
     struct t_rx_device *dev = &rx[device_id] ;
-    if( stub->tune( frq_hz ) ) {
-        dev->center_frq_hz = frq_hz ;
+    dev->rfHz = (double)frq_hz ;
+    if( dev->running ) {
         dev->context.ctx_version++ ;
         dev->context.center_freq = frq_hz ;
-        return(RC_OK);
+        dev->reinitReson = (mir_sdr_ReasonForReinitT)(dev->reinitReson | mir_sdr_CHANGE_RF_FREQ);
+        reinit_device(dev);
     }
+
+
     return(RC_NOK);
 }
 
@@ -490,11 +687,11 @@ LIBRARY_API int setRxCenterFreq( int device_id, int64_t frq_hz ) {
  */
 LIBRARY_API int64_t getRxCenterFreq( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
 
     struct t_rx_device *dev = &rx[device_id] ;
-    return( dev->center_frq_hz ) ;
+    return( (qint64)dev->rfHz ) ;
 }
 
 /**
@@ -506,7 +703,7 @@ LIBRARY_API int64_t getRxCenterFreq( int device_id ) {
  */
 LIBRARY_API int setRxGain( int device_id, int stage_id, float gain_value ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d,%f)\n", __func__, device_id,stage_id,gain_value);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
     if( stage_id >= 1 )
         return(RC_NOK);
@@ -514,15 +711,16 @@ LIBRARY_API int setRxGain( int device_id, int stage_id, float gain_value ) {
     struct t_rx_device *dev = &rx[device_id] ;
 
     // check value against device range
-    if( gain_value > dev->gain_max ) {
-        gain_value = dev->gain_max ;
-    }
-    if( gain_value < dev->gain_min ) {
-        gain_value = dev->gain_min ;
-    }
+    dev->gRdB = (int)fabs(gain_value);
+    if( dev->gRdB > dev->maxGain )
+        dev->gRdB = dev->maxGain ;
+    if( dev->gRdB < dev->minGain )
+        dev->gRdB = dev->minGain ;
 
-    stub->setGainReduction(fabsf(gain_value));
-    dev->gain = gain_value ;
+    if( dev->running ) {
+        dev->reinitReson = (mir_sdr_ReasonForReinitT)(dev->reinitReson | mir_sdr_CHANGE_GR);
+        reinit_device(dev);
+    }
 
     return(RC_OK);
 }
@@ -536,57 +734,135 @@ LIBRARY_API int setRxGain( int device_id, int stage_id, float gain_value ) {
 LIBRARY_API float getRxGainValue( int device_id , int stage_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id,stage_id);
 
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
     if( stage_id >= 1 )
         return(RC_NOK);
 
     struct t_rx_device *dev = &rx[device_id] ;
-    return( dev->gain) ;
+    return( -1*dev->gRdB ) ;
 }
 
 LIBRARY_API bool setAutoGainMode( int device_id ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    if( device_id >= device_count )
+    if( (unsigned int)device_id >= device_count )
         return(false);
     return(false);
 }
 
 //-----------------------------------------------------------------------------------------
-
-/**
- * @brief acquisition_thread This function is locked by the mutex and waits before starting the acquisition in asynch mode
- * @param params
- * @return
- */
-void* acquisition_thread( void *params ) {
-    TYPECPX *samples ;
-    int samplesPerPacket ;
-    struct t_rx_device* my_device = (struct t_rx_device*)params ;
-
-    if( DEBUG_DRIVER ) fprintf(stderr,"%s() start thread\n", __func__ );
-    for( ; ; ) {
-        my_device->running = false ;
-        if( DEBUG_DRIVER ) fprintf(stderr,"%s() thread waiting\n", __func__ );
-        if( DEBUG_DRIVER ) fflush(stderr);
-        sem_wait( &my_device->mutex );
-        if( DEBUG_DRIVER ) fprintf(stderr,"%s() rtlsdr_read_async\n", __func__ );
-
-        stub->setSamplingRate( my_device->current_sample_rate ) ;
-        if( stub->start() ) {
-            my_device->running = true ;
-            while( !my_device->acq_stop ) {
-                samples =  stub->getSamples( &samplesPerPacket );
-                // push samples to SDRNode callback function
-                // we only manage one channel per device
-                if( (*acqCbFunction)( my_device->uuid,
-                                      (float *)samples, samplesPerPacket, 1,
-                                      &my_device->context) <= 0 ) {
-                    free(samples);
-                }
-            }
-        }
+void set_gain_limits( struct t_rx_device* dev, double freq ) {
+    if (freq <= SDRPLAY_AM_MAX) {
+        dev->minGain = -4;
+        dev->maxGain = 98;
     }
-    return(NULL);
+    else if (freq <= SDRPLAY_FM_MAX) {
+        dev->minGain = 1;
+        dev->maxGain = 103;
+    }
+    else if (freq <= SDRPLAY_B3_MAX) {
+        dev->minGain = 5;
+        dev->maxGain = 107;
+    }
+    else if (freq <= SDRPLAY_B45_MAX) {
+        dev->minGain = 9;
+        dev->maxGain = 94;
+    }
+    else if (freq <= SDRPLAY_L_MAX) {
+        dev->minGain = 24;
+        dev->maxGain = 105;
+    }
 }
 
+
+
+void gcCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext) {
+    Q_UNUSED(gRdB);
+    Q_UNUSED(lnaGRdB);
+    Q_UNUSED(cbContext);
+    return;
+}
+
+void streamCallback(short *xi, short *xq, unsigned int firstSampleNum, int grChanged,
+                                            int rfChanged, int fsChanged, unsigned int numSamples, unsigned int reset,
+                                            void *cbContext) {
+
+    struct t_rx_device *dev = (struct t_rx_device *) cbContext;
+    Q_UNUSED(firstSampleNum);
+    Q_UNUSED(grChanged);
+    Q_UNUSED(rfChanged);
+    Q_UNUSED(reset);
+    Q_UNUSED(fsChanged);
+
+    TYPECPX tmp ;
+    unsigned int i ;
+    int j ;
+
+    for ( i=0 ; i < numSamples; i++) {
+            tmp.re = (float) xi[i] * 1.0 / SHRT_MAX;
+            tmp.im = (float) xq[i] * 1.0 / SHRT_MAX;
+            j = dev->wr_pos ;
+            if( j < dev->queue_size ) {
+                dev->samples_block[j] = tmp ;
+            } else {
+
+                (*acqCbFunction)( dev->uuid, (float *)dev->samples_block, dev->queue_size, 1, &dev->context ) ;
+                j = 0 ;
+                dev->samples_block = (TYPECPX *)malloc( dev->queue_size * sizeof(TYPECPX)) ;
+                dev->samples_block[0] = tmp ;
+            }
+            dev->wr_pos = j+1 ;
+    }
+
+
+}
+
+void reinit_device(struct t_rx_device* dev) {
+    int grMode ;
+
+    //(*call_mir_sdr_SetDeviceIdx)( dev->idx );
+
+    if (dev->running) {
+        grMode = mir_sdr_USE_SET_GR_ALT_MODE;
+
+        int err = (*call_mir_sdr_Reinit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6,
+                               dev->bwType,
+                               dev->ifType,
+                               (mir_sdr_LoModeT) 1,
+                               dev->lnaEnable,
+                               &grMode,
+                               (mir_sdr_SetGrModeT)1,
+                               &dev->samplesPerPacket,
+                               dev->reinitReson);
+        dev->reinitReson = mir_sdr_CHANGE_NONE ;
+        if( DEBUG_DRIVER ) qDebug() << "\nreinit_device() call_mir_sdr_Reinit rc = " << err ;
+    }
+    else {
+
+
+        if (dev->dcMode) {
+            (*call_mir_sdr_SetDcMode)(4, 1);
+        }
+        dev->wr_pos = 0 ;
+        dev->samples_block = (TYPECPX *)malloc( dev->queue_size * sizeof(TYPECPX)) ;
+        grMode = mir_sdr_USE_SET_GR_ALT_MODE ; //1
+        int err = (*call_mir_sdr_StreamInit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6, dev->bwType, dev->ifType,
+                                             dev->lnaEnable,
+                                             &dev->gRdBsystem,
+                                             (mir_sdr_SetGrModeT)grMode /* use internal gr tables acording to band */, &dev->samplesPerPacket,
+                                             streamCallback,
+                                             gcCallback, (void *)dev );
+
+        if (err != mir_sdr_Success) {
+            if( DEBUG_DRIVER ) qDebug() << "error PlayBoard::reinit_device()" << err ;
+            return ;
+        }
+
+        dev->running = true ;
+        dev->reinitReson = mir_sdr_CHANGE_NONE ;
+    }
+
+    set_gain_limits(dev, dev->rfHz);
+    dev->gain_dB = dev->maxGain - dev->gRdB;
+
+}

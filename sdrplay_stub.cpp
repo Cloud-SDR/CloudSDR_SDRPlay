@@ -118,12 +118,12 @@ int SDRPlayStub::getGainReductionValue() {
 SDRPlayStub::~SDRPlayStub() {
 }
 
-bool SDRPlayStub::loadDLL(LPCWSTR name ) {
+bool SDRPlayStub::loadDLL( QString name ) {
     mir_sdr_ErrT err;
     float ver;
 
 
-    extDLL = LoadLibrary( name);
+    extDLL = LoadLibrary( (const wchar_t*)name.utf16());
 
     if( extDLL == NULL ) {         
         return( false );

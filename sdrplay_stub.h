@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
+#include <QString>
 
 #ifdef _WIN64
 #include <tchar.h>
@@ -105,7 +106,7 @@ public:
     explicit SDRPlayStub();
     ~SDRPlayStub();
 
-    bool loadDLL(LPCWSTR name );
+    bool loadDLL(QString name );
     bool tune( int64_t freq );
     bool setSamplingRate( int sr_hz );
     TYPECPX *getSamples(int *count);

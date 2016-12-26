@@ -30,12 +30,13 @@
 #==========================================================================================
 
 
-QT       -= core gui
+QT       -= gui
+QT       += core
 
 TARGET = CloudSDR_SDRPlay
 TEMPLATE = lib
  
-LIBS += -lpthread  
+
 win32 {
     DESTDIR = C:/SDRNode/addons
     LIBS += -lusb-1.0
@@ -47,13 +48,12 @@ unix {
 }
 
 SOURCES += \
-    entrypoint.cpp \  
-    sdrplay_stub.cpp
+    entrypoint.cpp   
 
 HEADERS +=\ 
     entrypoint.h \  
     driver_version.h \
-    sdrplay_stub.h
+    mir_sdr.h
 
 OTHER_FILES += \
     resources.rc
