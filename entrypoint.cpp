@@ -256,7 +256,7 @@ LIBRARY_API int initLibrary(char *json_init_params,
 
     err = (*call_mir_sdr_ApiVersion)(&ver);
     if( DEBUG_DRIVER ) qDebug() << "sdr_ApiVersion() -->" << (ver) ;
-    if (ver != MIR_SDR_API_VERSION) {
+    if ((ver < MIR_SDR_API_VERSION) || (ver > MIR_SDR_API_VERSION_MAX )){
         if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "sdr_ApiVersion() not valid " ;
         return(-1);
     }
