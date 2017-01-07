@@ -667,13 +667,16 @@ LIBRARY_API int setRxCenterFreq( int device_id, int64_t frq_hz ) {
     if( DEBUG_DRIVER ) fflush(stderr);
     if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
+
     struct t_rx_device *dev = &rx[device_id] ;
     dev->rfHz = (double)frq_hz ;
+
     if( dev->running ) {
         dev->context.ctx_version++ ;
         dev->context.center_freq = frq_hz ;
         dev->reinitReson = (mir_sdr_ReasonForReinitT)(dev->reinitReson | mir_sdr_CHANGE_RF_FREQ);
         reinit_device(dev);
+        return(RC_OK);
     }
 
 
@@ -819,21 +822,27 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum, int grCha
 
 void reinit_device(struct t_rx_device* dev) {
     int grMode ;
-
+    int err ;
+    int retries ;
     //(*call_mir_sdr_SetDeviceIdx)( dev->idx );
 
     if (dev->running) {
         grMode = mir_sdr_USE_SET_GR_ALT_MODE;
-
-        int err = (*call_mir_sdr_Reinit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6,
-                               dev->bwType,
-                               dev->ifType,
-                               (mir_sdr_LoModeT) 1,
-                               dev->lnaEnable,
-                               &grMode,
-                               (mir_sdr_SetGrModeT)1,
-                               &dev->samplesPerPacket,
-                               dev->reinitReson);
+        err = mir_sdr_HwError ;
+        retries = 0 ;
+        while( (err != mir_sdr_Success ) && (retries++<3)){
+            err = (*call_mir_sdr_Reinit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6,
+                                   dev->bwType,
+                                   dev->ifType,
+                                   (mir_sdr_LoModeT) 1,
+                                   dev->lnaEnable,
+                                   &grMode,
+                                   (mir_sdr_SetGrModeT)1,
+                                   &dev->samplesPerPacket,
+                                   dev->reinitReson);
+            if( err != mir_sdr_Success )
+                usleep(2000);
+        }
         dev->reinitReson = mir_sdr_CHANGE_NONE ;
         if( DEBUG_DRIVER ) qDebug() << "\nreinit_device() call_mir_sdr_Reinit rc = " << err ;
     }
@@ -846,7 +855,16 @@ void reinit_device(struct t_rx_device* dev) {
         dev->wr_pos = 0 ;
         dev->samples_block = (TYPECPX *)malloc( dev->queue_size * sizeof(TYPECPX)) ;
         grMode = mir_sdr_USE_SET_GR_ALT_MODE ; //1
-        int err = (*call_mir_sdr_StreamInit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6, dev->bwType, dev->ifType,
+		
+		// revalidate decimation
+		if( dev->decimation > 1 )  {
+            (*call_mir_sdr_DecimateControl)(1, dev->decimation, 0);
+        } else {
+            (*call_mir_sdr_DecimateControl)(0, 2, 0);
+        }
+		
+		
+        err = (*call_mir_sdr_StreamInit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6, dev->bwType, dev->ifType,
                                              dev->lnaEnable,
                                              &dev->gRdBsystem,
                                              (mir_sdr_SetGrModeT)grMode /* use internal gr tables acording to band */, &dev->samplesPerPacket,
