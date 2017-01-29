@@ -16,6 +16,7 @@
 // Application code should check that it is compiled against the same API version
 // mir_sdr_ApiVersion() returns the API version 
 #define MIR_SDR_API_VERSION   (float)(2.07)
+#define MIR_SDR_API_VERSION_MAX (float)(2.09)
 
 #if defined(ANDROID) || defined(__ANDROID__)
 // Android requires a mechanism to request info from Java application

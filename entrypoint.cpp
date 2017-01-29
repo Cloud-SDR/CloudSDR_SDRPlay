@@ -46,8 +46,13 @@
 #include "entrypoint.h"
 #include "mir_sdr.h"
 
-#define DEBUG_DRIVER (0)
+#define RSP_UNINIT (0)
+#define RSP_RSPI (1)
+#define RSP_RSPII (2)
+
+#define DEBUG_DRIVER (1)
 #define MAX_RSP_BOARDS (8)
+
 #define SDRPLAY_AM_MIN     150e3
 #define SDRPLAY_AM_MAX      30e6
 #define SDRPLAY_FM_MIN      64e6
@@ -58,6 +63,9 @@
 #define SDRPLAY_B45_MAX    960e6
 #define SDRPLAY_L_MIN     1450e6
 #define SDRPLAY_L_MAX     1675e6
+
+#define GainTypeContinuous (0)
+#define GainTypeOnOff (2)
 
 char *driver_name ;
 
@@ -88,7 +96,7 @@ typedef struct __attribute__ ((__packed__)) _sCplx
 
 // this structure stores the device state
 struct t_rx_device {
-
+    int device_type ;
     char *device_name ;
     unsigned int idx ;
     char *device_serial_number ;
@@ -130,11 +138,13 @@ struct t_rx_device {
     TYPECPX yn_1 ;
 
     struct ext_Context context ;
+    int stage_count ;
+    char **stage_name ;
+    char **stage_unit ;
+    int *stage_type ;
 };
 
 unsigned int device_count ;
-char *stage_name ;
-char *stage_unit ;
 mir_sdr_DeviceT devices[MAX_RSP_BOARDS] ;
 struct t_rx_device *rx;
 
@@ -158,6 +168,12 @@ mir_sdr_StreamUninit_t call_mir_sdr_StreamUninit ;
 mir_sdr_SetDeviceIdx_t call_mir_sdr_SetDeviceIdx ;
 mir_sdr_ReleaseDeviceIdx_t call_mir_sdr_ReleaseDeviceIdx ;
 mir_sdr_GetHwVersion_t call_mir_sdr_GetHwVersion ;
+
+mir_sdr_RSPII_AntennaControl_t call_mir_sdr_RSPII_AntennaControl ;
+mir_sdr_RSPII_ExternalReferenceControl_t call_mir_sdr_RSPII_ExternalReferenceControl ;
+mir_sdr_RSPII_BiasTControl_t call_mir_sdr_RSPII_BiasTControl ;
+mir_sdr_RSPII_RfNotchEnable_t call_mir_sdr_RSPII_RfNotchEnable ;
+mir_sdr_AmPortSelect_t call_mir_sdr_AmPortSelect ;
 
 _tlogFun* sdrNode_LogFunction ;
 _pushSamplesFun *acqCbFunction ;
@@ -221,11 +237,12 @@ LIBRARY_API int initLibrary(char *json_init_params,
     fileName = m.value("Install_Dir").toString() + "\\x64\\mir_sdr_api.dll";
     m.endGroup();
 #else
-    fileName = "./mir_sdr_api.dll" ;
+    fileName = "libmirsdrapi-rsp.so" ;
 #endif
 
     QLibrary *extDLL = new QLibrary( fileName );
     if( extDLL == NULL ) {
+        qDebug() << "SDRPlayStub::loadDLL" << fileName << " fails." ;
         return(-1);
     }
     call_mir_sdr_ApiVersion = (mir_sdr_ApiVersion_t)extDLL->resolve("mir_sdr_ApiVersion");
@@ -248,6 +265,9 @@ LIBRARY_API int initLibrary(char *json_init_params,
     call_mir_sdr_SetDeviceIdx = (mir_sdr_SetDeviceIdx_t)extDLL->resolve("mir_sdr_SetDeviceIdx");
     call_mir_sdr_ReleaseDeviceIdx = (mir_sdr_ReleaseDeviceIdx_t)extDLL->resolve("mir_sdr_ReleaseDeviceIdx");
     call_mir_sdr_GetHwVersion = (mir_sdr_GetHwVersion_t)extDLL->resolve("mir_sdr_GetHwVersion");
+
+    call_mir_sdr_RSPII_AntennaControl = (mir_sdr_RSPII_AntennaControl_t)extDLL->resolve("mir_sdr_RSPII_AntennaControl");
+    call_mir_sdr_AmPortSelect = (mir_sdr_AmPortSelect_t)extDLL->resolve("mir_sdr_AmPortSelect");
 
     if( call_mir_sdr_ApiVersion == NULL ) {
         if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "resolve 'sdr_ApiVersion' fails" ;
@@ -301,7 +321,48 @@ LIBRARY_API int initLibrary(char *json_init_params,
         tmp->running = false ;
         tmp->device_name = (char *)malloc( 64 *sizeof(char));
         tmp->device_serial_number = (char *)malloc( 256 *sizeof(char));
-        sprintf( tmp->device_name, "SDRPlay");
+
+        switch( devices[d].hwVer ) {
+        case RSP_RSPII:
+            sprintf( tmp->device_name, "SdrPlay_RSP2");
+            tmp->stage_count = 2 ;
+            tmp->stage_name = (char **)malloc( tmp->stage_count * sizeof( char *));
+            tmp->stage_name[0] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_name[0], 64, "RF Atten.");
+            tmp->stage_name[1] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_name[1], 64, "RF Input");
+
+            tmp->stage_type = (int *)malloc( tmp->stage_count * sizeof( int ));
+            tmp->stage_type[0] = GainTypeContinuous ;
+            tmp->stage_type[1] = GainTypeOnOff ;
+
+            tmp->stage_unit = (char **)malloc( tmp->stage_count * sizeof( char *));
+            tmp->stage_unit[0] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_unit[0], 64, "dB");
+
+            tmp->stage_unit[1] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_unit[1], 64, "Input A:Input B");
+            break ;
+
+        case RSP_RSPI:
+        default:
+            sprintf( tmp->device_name, "SdrPlay_RSP1");
+            tmp->stage_count = 1 ;
+            tmp->stage_name = (char **)malloc( tmp->stage_count * sizeof( char *));
+            tmp->stage_name[0] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_name[0], 64, "RF Atten.");
+
+            tmp->stage_type = (int *)malloc( tmp->stage_count * sizeof( int ));
+            tmp->stage_type[0] = GainTypeContinuous ;
+
+            tmp->stage_unit = (char **)malloc( tmp->stage_count * sizeof( char *));
+            tmp->stage_unit[0] = (char *)malloc( 64 * sizeof(char));
+            snprintf( tmp->stage_unit[0], 64, "dB");
+
+            break ;
+        }
+        tmp->device_type = devices[d].hwVer ;
+
         sprintf( tmp->device_serial_number, "%s", devices[d].SerNo );
 
         tmp->min_frq_hz = 150e3 ;
@@ -373,15 +434,12 @@ LIBRARY_API int initLibrary(char *json_init_params,
 
         set_gain_limits( tmp, 96e6 );
 
-
+        tmp->xn_1.re = tmp->xn_1.im = 0 ;
+        tmp->yn_1.re = tmp->yn_1.im = 0 ;
         tmp->context.ctx_version = 0 ;
     }
 
-    // all RTLSDR have one single gain stage
-    stage_name = (char *)malloc( 10*sizeof(char));
-    snprintf( stage_name,10,"RFGain");
-    stage_unit = (char *)malloc( 10*sizeof(char));
-    snprintf( stage_unit,10,"dB");
+
     return(RC_OK);
 }
 
@@ -500,24 +558,36 @@ LIBRARY_API int64_t getMax_HWRx_CenterFreq(int device_id) {
 //-------------------------------------------------------------------
 LIBRARY_API int getRxGainStageCount(int device_id) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d)\n", __func__, device_id);
-    return(1);
+    if( (unsigned int)device_id >= device_count )
+        return(RC_NOK);
+
+    struct t_rx_device *dev = &rx[device_id] ;
+    return( dev->stage_count );
 }
 
 LIBRARY_API char* getRxGainStageName( int device_id, int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
-    return( stage_name );
+    if( (unsigned int)device_id >= device_count )
+        return(RC_NOK);
+
+    struct t_rx_device *dev = &rx[device_id] ;
+    stage = stage % dev->stage_count ; // stays in [0..stage_count]..
+    return( dev->stage_name[stage]);
 }
 
 LIBRARY_API char* getRxGainStageUnitName( int device_id, int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
     // RTLSDR have only one stage so the unit is same for all
-    return( stage_unit );
+    struct t_rx_device *dev = &rx[device_id] ;
+    stage = stage % dev->stage_count ; // stays in [0..stage_count]..
+    return( dev->stage_unit[stage]);
 }
 
 LIBRARY_API int getRxGainStageType( int device_id, int stage) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d)\n", __func__, device_id, stage );
-    // continuous value
-    return(0);
+    struct t_rx_device *dev = &rx[device_id] ;
+    stage = stage % dev->stage_count ; // stays in [0..stage_count]..
+    return( dev->stage_type[stage]);
 }
 
 LIBRARY_API float getMinGainValue(int device_id,int stage) {
@@ -708,10 +778,23 @@ LIBRARY_API int setRxGain( int device_id, int stage_id, float gain_value ) {
     if( DEBUG_DRIVER ) fprintf(stderr,"%s(%d,%d,%f)\n", __func__, device_id,stage_id,gain_value);
     if( (unsigned int)device_id >= device_count )
         return(RC_NOK);
-    if( stage_id >= 1 )
-        return(RC_NOK);
+
 
     struct t_rx_device *dev = &rx[device_id] ;
+    if( dev->device_type == RSP_RSPII ) {
+        if( stage_id == 1 ) {
+            if( gain_value > 0 ) {
+                if( call_mir_sdr_RSPII_AntennaControl != NULL ) {
+                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_A) ;
+                }
+            } else {
+                if( call_mir_sdr_RSPII_AntennaControl != NULL ) {
+                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_B) ;
+                }
+            }
+            return(RC_OK);
+        }
+    }
 
     // check value against device range
     dev->gRdB = (int)fabs(gain_value);
@@ -786,6 +869,7 @@ void gcCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext) {
     return;
 }
 
+#define ALPHA_DC (0.998)
 void streamCallback(short *xi, short *xq, unsigned int firstSampleNum, int grChanged,
                                             int rfChanged, int fsChanged, unsigned int numSamples, unsigned int reset,
                                             void *cbContext) {
@@ -799,20 +883,31 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum, int grCha
 
     TYPECPX tmp ;
     unsigned int i ;
+    float I,Q ;
     int j ;
 
     for ( i=0 ; i < numSamples; i++) {
-            tmp.re = (float) xi[i] * 1.0 / SHRT_MAX;
-            tmp.im = (float) xq[i] * 1.0 / SHRT_MAX;
+            I = (float) xi[i] * 1.0 / SHRT_MAX;
+            Q = (float) xq[i] * 1.0 / SHRT_MAX;
+            tmp.re = I - dev->xn_1.re + ALPHA_DC * dev->yn_1.re ;
+            tmp.im = Q - dev->xn_1.im + ALPHA_DC * dev->yn_1.im ;
+
+            dev->xn_1.re = I ;
+            dev->xn_1.im = Q ;
+
+            dev->yn_1.re = tmp.re ;
+            dev->yn_1.im = tmp.im ;
+
             j = dev->wr_pos ;
             if( j < dev->queue_size ) {
                 dev->samples_block[j] = tmp ;
             } else {
 
-                (*acqCbFunction)( dev->uuid, (float *)dev->samples_block, dev->queue_size, 1, &dev->context ) ;
-                j = 0 ;
+                (*acqCbFunction)( dev->uuid, (float *)dev->samples_block, j, 1, &dev->context ) ;
                 dev->samples_block = (TYPECPX *)malloc( dev->queue_size * sizeof(TYPECPX)) ;
                 dev->samples_block[0] = tmp ;
+                if( DEBUG_DRIVER ) qDebug() << "streamCallback() pushed:" << j << " samples" ;
+                j = 0 ;
             }
             dev->wr_pos = j+1 ;
     }
@@ -824,13 +919,14 @@ void reinit_device(struct t_rx_device* dev) {
     int grMode ;
     int err ;
     int retries ;
-    //(*call_mir_sdr_SetDeviceIdx)( dev->idx );
+
+    (*call_mir_sdr_SetDeviceIdx)( dev->idx );
 
     if (dev->running) {
         grMode = mir_sdr_USE_SET_GR_ALT_MODE;
         err = mir_sdr_HwError ;
         retries = 0 ;
-        while( (err != mir_sdr_Success ) && (retries++<3)){
+        while( (err != mir_sdr_Success ) && (retries++<5)){
             err = (*call_mir_sdr_Reinit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6,
                                    dev->bwType,
                                    dev->ifType,
@@ -842,6 +938,7 @@ void reinit_device(struct t_rx_device* dev) {
                                    dev->reinitReson);
             if( err != mir_sdr_Success )
                 usleep(2000);
+            if( DEBUG_DRIVER ) qDebug() << "reinit_device() retry:" << retries ;
         }
         dev->reinitReson = mir_sdr_CHANGE_NONE ;
         if( DEBUG_DRIVER ) qDebug() << "\nreinit_device() call_mir_sdr_Reinit rc = " << err ;
