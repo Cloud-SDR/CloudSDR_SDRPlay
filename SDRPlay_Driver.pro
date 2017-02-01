@@ -36,10 +36,11 @@ QT       += core
 TARGET = CloudSDR_SDRPlay
 TEMPLATE = lib
  
+LIBS += -lpthread
+LIBS += -lusb-1.0
 
 win32 {
     DESTDIR = C:/SDRNode/addons
-    LIBS += -lusb-1.0
     RC_FILE = resources.rc
 }
 
@@ -48,12 +49,30 @@ unix {
 }
 
 SOURCES += \
-    entrypoint.cpp   
+    entrypoint.cpp \
+    jansson/dump.c \
+    jansson/error.c \
+    jansson/hashtable.c \
+    jansson/hashtable_seed.c \
+    jansson/load.c \
+    jansson/memory.c \
+    jansson/pack_unpack.c \
+    jansson/strbuffer.c \
+    jansson/strconv.c \
+    jansson/utf.c \
+    jansson/value.c
 
 HEADERS +=\ 
     entrypoint.h \  
     driver_version.h \
-    mir_sdr.h
+    mir_sdr.h \
+    jansson/hashtable.h \
+    jansson/jansson.h \
+    jansson/jansson_config.h \
+    jansson/jansson_private.h \
+    jansson/lookup3.h \
+    jansson/strbuffer.h \
+    jansson/utf.h
 
 OTHER_FILES += \
     resources.rc

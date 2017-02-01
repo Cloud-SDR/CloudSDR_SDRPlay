@@ -50,7 +50,7 @@
 #define RSP_RSPI (1)
 #define RSP_RSPII (2)
 
-#define DEBUG_DRIVER (1)
+#define DEBUG_DRIVER (0)
 #define MAX_RSP_BOARDS (8)
 
 #define SDRPLAY_AM_MIN     150e3
@@ -174,9 +174,12 @@ mir_sdr_RSPII_ExternalReferenceControl_t call_mir_sdr_RSPII_ExternalReferenceCon
 mir_sdr_RSPII_BiasTControl_t call_mir_sdr_RSPII_BiasTControl ;
 mir_sdr_RSPII_RfNotchEnable_t call_mir_sdr_RSPII_RfNotchEnable ;
 mir_sdr_AmPortSelect_t call_mir_sdr_AmPortSelect ;
+mir_sdr_SetTransferMode_t call_mir_sdr_SetTransferMode ;
 
 _tlogFun* sdrNode_LogFunction ;
 _pushSamplesFun *acqCbFunction ;
+
+int last_device_id = -1 ;
 
 #ifdef _WIN64
 #include <windows.h>
@@ -268,6 +271,7 @@ LIBRARY_API int initLibrary(char *json_init_params,
 
     call_mir_sdr_RSPII_AntennaControl = (mir_sdr_RSPII_AntennaControl_t)extDLL->resolve("mir_sdr_RSPII_AntennaControl");
     call_mir_sdr_AmPortSelect = (mir_sdr_AmPortSelect_t)extDLL->resolve("mir_sdr_AmPortSelect");
+    call_mir_sdr_SetTransferMode = (mir_sdr_SetTransferMode_t)extDLL->resolve("mir_sdr_SetTransferMode") ;
 
     if( call_mir_sdr_ApiVersion == NULL ) {
         if(DEBUG_DRIVER ) qDebug() << "SDRPlayStub::loadDLL" << fileName << "resolve 'sdr_ApiVersion' fails" ;
@@ -291,6 +295,7 @@ LIBRARY_API int initLibrary(char *json_init_params,
     } else {
         (*call_mir_sdr_DebugEnable)(0);
     }
+    (*call_mir_sdr_DebugEnable)(1);
 
     err = (*call_mir_sdr_GetDevices)((mir_sdr_DeviceT*)&devices,
                                      &device_count, MAX_RSP_BOARDS);
@@ -299,6 +304,13 @@ LIBRARY_API int initLibrary(char *json_init_params,
         if( DEBUG_DRIVER ) qDebug() << "call_mir_sdr_GetDevices -->" << err ;
         return(-1);
     }
+
+#ifndef _WIN64
+        if( call_mir_sdr_SetTransferMode != NULL ) {
+          //  (*call_mir_sdr_SetTransferMode)(mir_sdr_BULK) ;
+        }
+#endif
+
 
 
    if( DEBUG_DRIVER ) qDebug() << "PlayTools::PlayTools() ok with board_count=" << device_count ;
@@ -785,11 +797,11 @@ LIBRARY_API int setRxGain( int device_id, int stage_id, float gain_value ) {
         if( stage_id == 1 ) {
             if( gain_value > 0 ) {
                 if( call_mir_sdr_RSPII_AntennaControl != NULL ) {
-                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_A) ;
+                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_B) ;
                 }
             } else {
                 if( call_mir_sdr_RSPII_AntennaControl != NULL ) {
-                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_B) ;
+                    (*call_mir_sdr_RSPII_AntennaControl)(mir_sdr_RSPII_ANTENNA_A) ;
                 }
             }
             return(RC_OK);
@@ -920,7 +932,10 @@ void reinit_device(struct t_rx_device* dev) {
     int err ;
     int retries ;
 
-    (*call_mir_sdr_SetDeviceIdx)( dev->idx );
+//    if( dev->idx != last_device_id ) {
+//        (*call_mir_sdr_SetDeviceIdx)( dev->idx );
+//        last_device_id = dev->idx ;
+//    }
 
     if (dev->running) {
         grMode = mir_sdr_USE_SET_GR_ALT_MODE;
@@ -952,15 +967,7 @@ void reinit_device(struct t_rx_device* dev) {
         dev->wr_pos = 0 ;
         dev->samples_block = (TYPECPX *)malloc( dev->queue_size * sizeof(TYPECPX)) ;
         grMode = mir_sdr_USE_SET_GR_ALT_MODE ; //1
-		
-		// revalidate decimation
-		if( dev->decimation > 1 )  {
-            (*call_mir_sdr_DecimateControl)(1, dev->decimation, 0);
-        } else {
-            (*call_mir_sdr_DecimateControl)(0, 2, 0);
-        }
-		
-		
+
         err = (*call_mir_sdr_StreamInit)(&dev->gRdB, dev->fsHz / 1e6, dev->rfHz / 1e6, dev->bwType, dev->ifType,
                                              dev->lnaEnable,
                                              &dev->gRdBsystem,
@@ -971,6 +978,13 @@ void reinit_device(struct t_rx_device* dev) {
         if (err != mir_sdr_Success) {
             if( DEBUG_DRIVER ) qDebug() << "error PlayBoard::reinit_device()" << err ;
             return ;
+        }
+
+        // revalidate decimation
+        if( dev->decimation > 1 )  {
+            (*call_mir_sdr_DecimateControl)(1, dev->decimation, 0);
+        } else {
+            (*call_mir_sdr_DecimateControl)(0, 2, 0);
         }
 
         dev->running = true ;
